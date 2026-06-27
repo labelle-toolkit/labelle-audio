@@ -182,7 +182,10 @@ pub fn Mixer(comptime Sink: type) type {
         /// PCM (copies it). The in-memory counterpart of a WAV load — used by
         /// e.g. a video audio-track feeder. Caller keeps ownership of `src`.
         fn adoptPcm(src: []const i16, channels: u8, sample_rate: u32) ?PcmData {
-            if (src.len == 0 or channels == 0 or src.len % channels != 0) return null;
+            // The mixer only renders mono/stereo (mixPcmInto expands mono → 2ch
+            // and copies stereo); reject >2 channels rather than silently drop
+            // the extra ones, matching the WAV decoder's strict validation.
+            if (src.len == 0 or channels == 0 or channels > 2 or src.len % channels != 0) return null;
             const owned = allocator.alloc(i16, src.len) catch return null;
             @memcpy(owned, src);
             return PcmData{
@@ -247,7 +250,7 @@ pub fn Mixer(comptime Sink: type) type {
         /// the lock — by which point the mixer no longer holds a pointer into
         /// it (#298 UAF fix).
         pub fn unloadSound(id: u32) void {
-            if (id >= MAX_SOUNDS) return;
+            if (id == 0 or id >= MAX_SOUNDS) return;
             lockSlots();
             const pcm = sounds[id].pcm;
             sounds[id] = .{};
@@ -257,7 +260,7 @@ pub fn Mixer(comptime Sink: type) type {
 
         pub fn playSound(id: u32) void {
             ensureInit();
-            if (id >= MAX_SOUNDS) return;
+            if (id == 0 or id >= MAX_SOUNDS) return;
             lockSlots();
             sounds[id].playing = true;
             sounds[id].position = 0;
@@ -265,7 +268,7 @@ pub fn Mixer(comptime Sink: type) type {
         }
 
         pub fn stopSound(id: u32) void {
-            if (id >= MAX_SOUNDS) return;
+            if (id == 0 or id >= MAX_SOUNDS) return;
             lockSlots();
             sounds[id].playing = false;
             sounds[id].position = 0;
@@ -273,14 +276,14 @@ pub fn Mixer(comptime Sink: type) type {
         }
 
         pub fn isSoundPlaying(id: u32) bool {
-            if (id >= MAX_SOUNDS) return false;
+            if (id == 0 or id >= MAX_SOUNDS) return false;
             lockSlots();
             defer unlockSlots();
             return sounds[id].playing;
         }
 
         pub fn setSoundVolume(id: u32, volume: f32) void {
-            if (id >= MAX_SOUNDS) return;
+            if (id == 0 or id >= MAX_SOUNDS) return;
             lockSlots();
             sounds[id].volume = std.math.clamp(volume, 0.0, 1.0);
             unlockSlots();
@@ -334,7 +337,7 @@ pub fn Mixer(comptime Sink: type) type {
         }
 
         pub fn unloadMusic(id: u32) void {
-            if (id >= MAX_MUSIC) return;
+            if (id == 0 or id >= MAX_MUSIC) return;
             lockSlots();
             const pcm = music_slots[id].pcm;
             music_slots[id] = .{};
@@ -344,7 +347,7 @@ pub fn Mixer(comptime Sink: type) type {
 
         pub fn playMusic(id: u32) void {
             ensureInit();
-            if (id >= MAX_MUSIC) return;
+            if (id == 0 or id >= MAX_MUSIC) return;
             lockSlots();
             music_slots[id].playing = true;
             music_slots[id].paused = false;
@@ -353,7 +356,7 @@ pub fn Mixer(comptime Sink: type) type {
         }
 
         pub fn stopMusic(id: u32) void {
-            if (id >= MAX_MUSIC) return;
+            if (id == 0 or id >= MAX_MUSIC) return;
             lockSlots();
             music_slots[id].playing = false;
             music_slots[id].paused = false;
@@ -362,28 +365,28 @@ pub fn Mixer(comptime Sink: type) type {
         }
 
         pub fn pauseMusic(id: u32) void {
-            if (id >= MAX_MUSIC) return;
+            if (id == 0 or id >= MAX_MUSIC) return;
             lockSlots();
             if (music_slots[id].playing) music_slots[id].paused = true;
             unlockSlots();
         }
 
         pub fn resumeMusic(id: u32) void {
-            if (id >= MAX_MUSIC) return;
+            if (id == 0 or id >= MAX_MUSIC) return;
             lockSlots();
             if (music_slots[id].paused) music_slots[id].paused = false;
             unlockSlots();
         }
 
         pub fn isMusicPlaying(id: u32) bool {
-            if (id >= MAX_MUSIC) return false;
+            if (id == 0 or id >= MAX_MUSIC) return false;
             lockSlots();
             defer unlockSlots();
             return music_slots[id].playing and !music_slots[id].paused;
         }
 
         pub fn setMusicVolume(id: u32, volume: f32) void {
-            if (id >= MAX_MUSIC) return;
+            if (id == 0 or id >= MAX_MUSIC) return;
             lockSlots();
             music_slots[id].volume = std.math.clamp(volume, 0.0, 1.0);
             unlockSlots();
