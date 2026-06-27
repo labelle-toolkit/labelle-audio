@@ -62,3 +62,35 @@ test "Backend: audio discard path frees decoded samples without uploadSound" {
     // decoded.samples.
     testing.allocator.free(decoded.samples);
 }
+
+// -- Shared-mixer conformance (Phase 2) -------------------------------
+//
+// Prove `Mixer(NullSink)` satisfies labelle-core's `AudioInterface(Impl)`
+// playback contract — the surface the assembler adapts backends to. If the
+// mixer ever drops a required method this fails at comptime, so the shared
+// engine can't drift from the interface.
+
+const core = @import("labelle-core");
+
+test "Mixer(NullSink) satisfies labelle-core AudioInterface" {
+    const M = audio.Mixer(audio.NullSink);
+    // AudioInterface(Impl) @compileErrors if playSound/stopSound are missing,
+    // and @hasDecl-dispatches the optional surface — so constructing it is the
+    // conformance assertion.
+    const Iface = core.AudioInterface(M);
+    try testing.expectEqual(M, Iface.Implementation);
+
+    // Optional methods the mixer implements are dispatched (not stubbed).
+    M.resetForTest();
+    M.init(testing.allocator);
+    defer M.deinit();
+    Iface.setVolume(0.5); // routes to M.setVolume, not the no-op fallback
+}
+
+test "DeviceSink contract: NullSink conforms, incomplete impls are named" {
+    try testing.expectEqual(@as(usize, 0), comptime audio.device_sink.missingDeviceSinkDecls(audio.NullSink).len);
+    const Incomplete = struct {
+        pub fn ensureStarted(_: audio.MixCallback) void {}
+    };
+    try testing.expect(comptime audio.device_sink.missingDeviceSinkDecls(Incomplete).len == 2);
+}
