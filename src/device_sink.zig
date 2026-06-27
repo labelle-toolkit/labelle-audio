@@ -32,12 +32,43 @@ const std = @import("std");
 /// interleave width of `out`) rather than a redundant frame count — the sink
 /// already knows `out.len`, and the mixer needs the channel layout to expand
 /// mono PCM correctly. `out.len` is always `frames * channels`. i16 internal
-/// format (matches bgfx).
-///
-/// TODO(f32): sokol-audio's device callback hands out f32 buffers. When that
-/// sink lands, either add an f32 `MixCallbackF32` variant + a `format` decl on
-/// the sink, or make the sample type a comptime parameter of the contract.
+/// format (matches bgfx). This is the **default** callback shape; a sink that
+/// declares `pub const sample_format = .f32` instead receives `MixCallbackF32`.
 pub const MixCallback = *const fn (out: []i16, channels: u8) void;
+
+/// f32 variant of the fill callback — the sokol-audio path. `sokol_audio.h`'s
+/// stream callback hands the app a `[*]f32` buffer it must fill in normalized
+/// `[-1.0, 1.0]` interleaved samples; a sink that wraps it declares
+/// `pub const sample_format: SampleFormat = .f32` and receives this signature.
+/// Same `out.len == frames * channels` invariant; same mono-expand contract.
+pub const MixCallbackF32 = *const fn (out: []f32, channels: u8) void;
+
+/// The output sample type a device sink wants the mixer to render into. The
+/// mixer's internal PCM stays i16 (decoded WAV is i16) regardless; this only
+/// selects the *output* buffer the mix is rendered into and the matching
+/// callback signature. A sink declares it via an optional
+/// `pub const sample_format: SampleFormat = ...;` decl — **absent means `.i16`**
+/// so every existing sink (bgfx's miniaudio/AAudio, `NullSink`) is unchanged.
+pub const SampleFormat = enum { i16, f32 };
+
+/// Resolve a sink's chosen output sample format. The contract default is `.i16`
+/// (back-compat: the i16 path predates this and every shipped sink omits the
+/// decl). A sink opts into f32 with `pub const sample_format = .f32;`.
+pub fn sampleFormatOf(comptime Impl: type) SampleFormat {
+    comptime {
+        if (!@hasDecl(Impl, "sample_format")) return .i16;
+        return Impl.sample_format;
+    }
+}
+
+/// The mix-callback type a sink with the given format expects, so the mixer
+/// can pick the right thunk signature at comptime.
+pub fn MixCallbackFor(comptime fmt: SampleFormat) type {
+    return switch (fmt) {
+        .i16 => MixCallback,
+        .f32 => MixCallbackF32,
+    };
+}
 
 /// Required function decls every device-sink `Impl` must define. Names only —
 /// `missingDeviceSinkDecls` probes `@hasDecl`, matching the render contract's
@@ -86,9 +117,19 @@ pub fn DeviceSink(comptime Impl: type) type {
     return struct {
         pub const Implementation = Impl;
 
+        /// The output sample format this sink renders in — `.i16` (default) or
+        /// `.f32` (sokol-audio). Drives which `mix` thunk `Mixer` wires up.
+        pub const sample_format: SampleFormat = sampleFormatOf(Impl);
+
+        /// The callback signature this sink's `ensureStarted` takes, resolved
+        /// from `sample_format`. `MixCallback` for i16, `MixCallbackF32` for
+        /// f32.
+        pub const Callback = MixCallbackFor(sample_format);
+
         /// Open + start the device on first use, wiring `mix` as the
-        /// audio-thread fill callback. Idempotent.
-        pub inline fn ensureStarted(mix: MixCallback) void {
+        /// audio-thread fill callback. Idempotent. `mix` is `MixCallback`
+        /// (i16) or `MixCallbackF32` depending on `sample_format`.
+        pub inline fn ensureStarted(mix: Callback) void {
             Impl.ensureStarted(mix);
         }
 
@@ -150,6 +191,48 @@ pub const NullSink = struct {
     }
 };
 
+/// f32 counterpart of `NullSink` — the headless reference sink for the **f32
+/// output path** (the sokol-audio shape). Identical to `NullSink` except it
+/// declares `sample_format = .f32`, so `Mixer(NullSinkF32)` renders the mix
+/// into f32 and `ensureStarted` takes a `MixCallbackF32`. Two uses: testing
+/// the f32 mix without a speaker, and acting as the template a real sokol sink
+/// follows (`ensureStarted(f32 cb)` / `stop` / `framesMixed`, plus
+/// `sample_format`). Single-threaded by construction — no device thread.
+pub const NullSinkF32 = struct {
+    /// Opt into the f32 render path. This single decl is the entire difference
+    /// from `NullSink` — everything else mirrors the i16 reference sink.
+    pub const sample_format: SampleFormat = .f32;
+
+    var stored_mix: ?MixCallbackF32 = null;
+    var started: bool = false;
+
+    pub fn ensureStarted(mix: MixCallbackF32) void {
+        stored_mix = mix;
+        started = true;
+    }
+
+    pub fn stop() void {
+        started = false;
+        stored_mix = null;
+    }
+
+    /// Always 0 — a null sink never pushes frames through a device callback.
+    pub fn framesMixed() u64 {
+        return 0;
+    }
+
+    // -- NullSinkF32-only helpers (not part of the contract) -----------
+
+    /// The f32 mix callback wired by `ensureStarted`, or null if never started.
+    pub fn mixCallback() ?MixCallbackF32 {
+        return stored_mix;
+    }
+
+    pub fn isStarted() bool {
+        return started;
+    }
+};
+
 // -- Tests ------------------------------------------------------------
 
 const testing = std.testing;
@@ -185,4 +268,34 @@ test "NullSink ensureStarted stores the callback without invoking it" {
     try testing.expect(NullSink.mixCallback() != null);
     DeviceSink(NullSink).stop();
     try testing.expect(!NullSink.isStarted());
+}
+
+test "sample_format defaults to i16 when the sink omits the decl" {
+    // NullSink declares no sample_format -> back-compat default .i16.
+    try testing.expectEqual(SampleFormat.i16, comptime sampleFormatOf(NullSink));
+    try testing.expectEqual(SampleFormat.i16, DeviceSink(NullSink).sample_format);
+    try testing.expectEqual(MixCallback, DeviceSink(NullSink).Callback);
+}
+
+test "NullSinkF32 selects the f32 output path" {
+    try testing.expectEqual(@as(usize, 0), comptime missingDeviceSinkDecls(NullSinkF32).len);
+    try testing.expectEqual(SampleFormat.f32, comptime sampleFormatOf(NullSinkF32));
+    try testing.expectEqual(SampleFormat.f32, DeviceSink(NullSinkF32).sample_format);
+    try testing.expectEqual(MixCallbackF32, DeviceSink(NullSinkF32).Callback);
+}
+
+test "NullSinkF32 ensureStarted stores the f32 callback without invoking it" {
+    const Probe = struct {
+        var called: bool = false;
+        fn cb(_: []f32, _: u8) void {
+            called = true;
+        }
+    };
+    Probe.called = false;
+    DeviceSink(NullSinkF32).ensureStarted(&Probe.cb);
+    try testing.expect(NullSinkF32.isStarted());
+    try testing.expect(!Probe.called);
+    try testing.expect(NullSinkF32.mixCallback() != null);
+    DeviceSink(NullSinkF32).stop();
+    try testing.expect(!NullSinkF32.isStarted());
 }

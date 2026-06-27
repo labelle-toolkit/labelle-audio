@@ -74,6 +74,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_mixer_spec = b.addRunArtifact(mixer_spec);
 
+    // The f32 output-path specs (sokol-audio shape) — `Mixer(NullSinkF32)` /
+    // `mixF32`. Separate module from the i16 specs so each stays focused.
+    const mixer_f32_spec = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/mixer_f32_spec.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "labelle-audio", .module = audio_module },
+                .{ .name = "labelle-core", .module = core_mod },
+            },
+        }),
+        .test_runner = .{ .path = zspec.path("src/runner.zig"), .mode = .simple },
+    });
+    const run_mixer_f32_spec = b.addRunArtifact(mixer_f32_spec);
+
     const spec_step = b.step("spec", "Run zspec behavioral specs");
     spec_step.dependOn(&run_mixer_spec.step);
+    spec_step.dependOn(&run_mixer_f32_spec.step);
 }
