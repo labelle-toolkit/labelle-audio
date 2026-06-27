@@ -11,16 +11,15 @@ pub fn build(b: *std.Build) void {
     }).module("labelle-core");
     const zspec = b.dependency("zspec", .{ .target = target, .optimize = optimize });
 
-    // The shared audio module. `labelle-core` is imported so the mixer can be
-    // comptime-checked against `AudioInterface` (only used by tests today, but
-    // the module carries the import so consumers/specs resolve it).
+    // The shared audio module. It has NO dependencies — the source never
+    // imports `labelle-core` (the `AudioInterface` comptime conformance check
+    // lives in the tests, which carry the core import themselves). Keeping the
+    // consumed module dependency-free means a backend (bgfx, …) that imports it
+    // doesn't transitively pull a second labelle-core into its build graph.
     const audio_module = b.addModule("labelle-audio", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "labelle-core", .module = core_mod },
-        },
     });
 
     // -- `test`: built-in unit tests -----------------------------------
