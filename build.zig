@@ -37,6 +37,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/decode.zig"),
         .target = target,
         .optimize = optimize,
+        // stb_vorbis.c pulls in <stdio.h>/<stdlib.h>/<math.h>; macOS links libc by
+        // default but Linux CI needs it explicit, or the C TU fails to find the
+        // headers. Propagates to any artifact that uses this module.
+        .link_libc = true,
     });
     decode_module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
     decode_module.addIncludePath(b.path("src"));
@@ -76,6 +80,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/decode.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true, // stb_vorbis.c needs libc headers (Linux CI)
         }),
     });
     decode_tests.root_module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
