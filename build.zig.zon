@@ -1,13 +1,27 @@
 .{
     .fingerprint = 0xd0a63a2160660441,
     .name = .labelle_audio,
-    .version = "0.1.0",
-    .minimum_zig_version = "0.15.2",
-    .dependencies = .{},
+    .version = "0.2.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // labelle-core supplies the `AudioInterface(Impl)` playback contract.
+        // The shared `Mixer(Sink)` is comptime-checked against it (see
+        // build.zig's conformance test) so the mixer can never drift from the
+        // interface backends adapt to.
+        .labelle_core = .{
+            .path = "../labelle-core",
+        },
+        // zspec drives the BDD-style `spec` step (the toolkit convention).
+        .zspec = .{
+            .url = "https://github.com/apotema/zspec/archive/v0.9.2.tar.gz",
+            .hash = "zspec-0.9.1-jaKLbXgMBACFwbNjflhbMyP113leoYjboxn-1UOP-FGw",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "test",
         "README.md",
     },
 }
