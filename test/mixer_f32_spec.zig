@@ -248,3 +248,29 @@ test "the i16 path is untouched: i16 sink still mixes to i16 unchanged" {
     try testing.expectEqual(@as(i16, 200), out[2]);
     try testing.expectEqual(@as(i16, 200), out[3]);
 }
+
+// -- Inter-voice headroom (clamp once, not per voice) ------------------
+// Regression for the f32 mix bug: voices are summed UNCLAMPED, then clamped a
+// single time. A loud voice partially cancelled by another must preserve the
+// post-sum value, not clip prematurely (#3 — Gemini + CodeRabbit).
+test "f32 mix preserves inter-voice headroom" {
+    MF.resetForTest();
+    MF.init(testing.allocator);
+    defer MF.deinit();
+
+    // 0.8 + 0.8 − 0.9 = 0.7. With per-voice clamping the first two saturate to
+    // 1.0 before the third pulls back, yielding ~0.1; a single end clamp → 0.7.
+    const wp = try monoWav(testing.allocator, &[_]i16{26214}); // ≈ +0.8
+    defer testing.allocator.free(wp);
+    const wn = try monoWav(testing.allocator, &[_]i16{-29491}); // ≈ −0.9
+    defer testing.allocator.free(wn);
+
+    MF.playSound(MF.loadSoundFromMemory(wp));
+    MF.playSound(MF.loadSoundFromMemory(wp));
+    MF.playSound(MF.loadSoundFromMemory(wn));
+
+    var out = [_]f32{0} ** 2;
+    MF.mixF32(&out, 2);
+    try expectClose(0.7, out[0]);
+    try expectClose(0.7, out[1]);
+}

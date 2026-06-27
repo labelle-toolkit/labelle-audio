@@ -596,11 +596,16 @@ pub fn Mixer(comptime Sink: type) type {
                     slot.position = 0;
                 }
             }
+
+            // Single clamp pass after ALL voices are summed — preserves
+            // inter-voice headroom (no premature per-voice clipping).
+            for (out) |*s| s.* = std.math.clamp(s.*, -1.0, 1.0);
         }
 
         /// f32 counterpart of `mixPcmInto`. i16 PCM is converted to normalized
-        /// f32 (`sample / 32768.0`), scaled by `volume`, summed into `out`, and
-        /// clamped to `[-1.0, 1.0]`. Mixing in f32 throughout (no intermediate
+        /// f32 (`sample / 32768.0`), scaled by `volume`, and summed UNCLAMPED
+        /// into `out` (`mixF32` clamps once after all voices). Mixing in f32
+        /// throughout (no intermediate
         /// i16 round-trip) avoids the double-quantization an i16-then-convert
         /// boundary would introduce. Mono duplicates to both channels; stereo
         /// stays separate; looping wraps, non-looping breaks at end-of-buffer.
@@ -626,10 +631,12 @@ pub fn Mixer(comptime Sink: type) type {
                     left; // mono -> duplicate to both channels
 
                 const out_idx: usize = @as(usize, frame) * 2;
-                const mixed_l = out[out_idx] + left * volume;
-                const mixed_r = out[out_idx + 1] + right * volume;
-                out[out_idx] = std.math.clamp(mixed_l, -1.0, 1.0);
-                out[out_idx + 1] = std.math.clamp(mixed_r, -1.0, 1.0);
+                // Accumulate UNCLAMPED. f32 has the headroom, and clamping each
+                // voice as it's summed would clip prematurely — e.g. two loud
+                // opposite-sign voices that should cancel would each saturate
+                // first. `mixF32` clamps once after every voice is summed.
+                out[out_idx] += left * volume;
+                out[out_idx + 1] += right * volume;
                 pos += 1;
             }
             position.* = pos;
