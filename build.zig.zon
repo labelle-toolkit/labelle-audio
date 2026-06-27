@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xd0a63a2160660441,
     .name = .labelle_audio,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // labelle-core supplies the `AudioInterface(Impl)` playback contract.
@@ -9,7 +9,8 @@
         // build.zig's conformance test) so the mixer can never drift from the
         // interface backends adapt to.
         .labelle_core = .{
-            .path = "../labelle-core",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.19.0.tar.gz",
+            .hash = "labelle_core-1.19.0-OauRcOukBADj0bh6GI5MX_vmI8gLJUbIEutPyGXnaLWC",
         },
         // zspec drives the BDD-style `spec` step (the toolkit convention).
         .zspec = .{
