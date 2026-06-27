@@ -21,11 +21,20 @@
 //! detaches the slot under the lock, then frees the PCM backing **after**
 //! releasing the lock — so the mixer can never read a half-freed buffer.
 //!
-//! ## Internal format
-//! i16, matching bgfx and the i16 `DeviceSink.MixCallback`.
-//! TODO(f32): sokol-audio's device callback is f32. Generalizing the internal
-//! format to f32 (or a comptime sample-type parameter) is a later slice — see
-//! the same TODO on `device_sink.MixCallback`.
+//! ## Internal vs output format
+//! The mixer's **internal** PCM is always **i16** — decoded WAV is i16 and the
+//! slot buffers stay i16 regardless of output. What varies is the **output**
+//! buffer the mix is rendered into, chosen by the injected sink's
+//! `sample_format` (`device_sink.SampleFormat`):
+//!   * `.i16` (default, absent decl) — the original bgfx path. `mix(out: []i16)`
+//!     sums in f32 and clamps to i16. 100% unchanged.
+//!   * `.f32` (sokol-audio) — `mixF32(out: []f32)` sums in f32 and writes
+//!     normalized `[-1.0, 1.0]` samples directly. i16 PCM → f32 is
+//!     `sample / 32768.0`; the per-source/master volume and N-voice sum happen
+//!     in f32, then a single clamp to `[-1, 1]` at the boundary — so the f32
+//!     path avoids the double-quantization an i16-mix-then-convert would incur.
+//! Both render paths share the slot arrays, spinlock, and advance/loop logic;
+//! the only divergence is the output element type and the final write.
 const std = @import("std");
 
 const wav = @import("wav.zig");
@@ -33,6 +42,13 @@ const device_sink = @import("device_sink.zig");
 
 pub const DecodedAudio = wav.DecodedAudio;
 pub const MixCallback = device_sink.MixCallback;
+pub const MixCallbackF32 = device_sink.MixCallbackF32;
+pub const SampleFormat = device_sink.SampleFormat;
+
+/// Divisor mapping a full-scale i16 to a normalized f32 in `[-1.0, 1.0)`.
+/// `-32768 / 32768 = -1.0` exactly; `+32767 / 32768 ≈ 0.99997` (full-scale
+/// positive i16 is one LSB short of +1.0 — the standard asymmetric PCM range).
+const I16_TO_F32: f32 = 32768.0;
 
 /// Per-`Mixer` slot caps. Match bgfx's MAX_SOUNDS / MAX_MUSIC.
 pub const MAX_SOUNDS = 256;
@@ -82,6 +98,11 @@ pub fn Mixer(comptime Sink: type) type {
         const Self = @This();
         const Device = device_sink.DeviceSink(Sink);
 
+        /// Output sample format this mixer renders in, resolved from the sink.
+        /// `.i16` (default) drives the original `mix` path; `.f32` drives
+        /// `mixF32`. Exposed so a host / the assembler adapter can introspect.
+        pub const sample_format: SampleFormat = Device.sample_format;
+
         // -- Per-instantiation state ----------------------------------
         var sounds: [MAX_SOUNDS]SoundSlot = [_]SoundSlot{.{}} ** MAX_SOUNDS;
         var music_slots: [MAX_MUSIC]MusicSlot = [_]MusicSlot{.{}} ** MAX_MUSIC;
@@ -126,8 +147,14 @@ pub fn Mixer(comptime Sink: type) type {
         /// Open the device on first use, wiring the mixer as the audio-thread
         /// fill callback. Idempotent and cheap to call from every entry point
         /// that can start audio. On a `NullSink` this is a no-op pump-wise.
+        /// The thunk wired matches the sink's `sample_format` — i16 sinks get
+        /// `mixThunk`, f32 sinks get `mixThunkF32` — resolved at comptime so
+        /// there is zero runtime branch and the unused path is never wired.
         pub fn ensureInit() void {
-            Device.ensureStarted(&mixThunk);
+            switch (sample_format) {
+                .i16 => Device.ensureStarted(&mixThunk),
+                .f32 => Device.ensureStarted(&mixThunkF32),
+            }
         }
 
         /// Cumulative frames pushed through the device callback. >0 confirms a
@@ -517,6 +544,97 @@ pub fn Mixer(comptime Sink: type) type {
             position.* = pos;
         }
 
+        // -- The mixer: f32 output path (sokol-audio) -----------------
+        //
+        // Structurally identical to the i16 path above; the only differences
+        // are the output element type (`[]f32`) and the per-sample conversion
+        // / write (i16 PCM -> normalized f32, clamp to [-1, 1]). Kept as a
+        // parallel path rather than a generic over the i16 one so the i16 mix
+        // stays byte-for-byte unchanged (bgfx depends on it).
+
+        /// Thunk matching `device_sink.MixCallbackF32` — an f32 device thread
+        /// (sokol-audio) calls this; it forwards to `mixF32`.
+        fn mixThunkF32(out: []f32, channels: u8) void {
+            mixF32(out, channels);
+        }
+
+        /// Mix all active sounds and music into the interleaved **f32** `out`
+        /// buffer (`out.len == frames * channels`), writing normalized
+        /// `[-1.0, 1.0]` samples. The f32 counterpart of `mix`, for sinks that
+        /// declare `sample_format = .f32` (sokol-audio's f32 stream callback).
+        /// Same slot lock, same stereo-only constraint, same advance/loop
+        /// semantics — only the output type and conversion differ.
+        pub fn mixF32(out: []f32, channels: u8) void {
+            @memset(out, 0);
+            if (channels != 2) return; // only stereo output today (matches bgfx)
+            const out_channels: usize = 2;
+            const frame_count: u32 = @intCast(out.len / out_channels);
+
+            lockSlots();
+            defer unlockSlots();
+
+            for (0..MAX_SOUNDS) |i| {
+                var slot = &sounds[i];
+                if (!slot.playing) continue;
+                const pcm = slot.pcm orelse continue;
+                const vol = slot.volume * master_volume;
+                mixPcmIntoF32(out, frame_count, pcm, &slot.position, vol, false);
+                if (slot.position >= pcm.frame_count) {
+                    slot.playing = false;
+                    slot.position = 0;
+                }
+            }
+
+            for (0..MAX_MUSIC) |i| {
+                var slot = &music_slots[i];
+                if (!slot.playing or slot.paused) continue;
+                const pcm = slot.pcm orelse continue;
+                const vol = slot.volume * master_volume;
+                mixPcmIntoF32(out, frame_count, pcm, &slot.position, vol, slot.looping);
+                if (!slot.looping and slot.position >= pcm.frame_count) {
+                    slot.playing = false;
+                    slot.position = 0;
+                }
+            }
+        }
+
+        /// f32 counterpart of `mixPcmInto`. i16 PCM is converted to normalized
+        /// f32 (`sample / 32768.0`), scaled by `volume`, summed into `out`, and
+        /// clamped to `[-1.0, 1.0]`. Mixing in f32 throughout (no intermediate
+        /// i16 round-trip) avoids the double-quantization an i16-then-convert
+        /// boundary would introduce. Mono duplicates to both channels; stereo
+        /// stays separate; looping wraps, non-looping breaks at end-of-buffer.
+        fn mixPcmIntoF32(
+            out: []f32,
+            frame_count: u32,
+            pcm: PcmData,
+            position: *u32,
+            volume: f32,
+            looping: bool,
+        ) void {
+            var pos = position.*;
+            var frame: u32 = 0;
+            while (frame < frame_count) : (frame += 1) {
+                if (pos >= pcm.frame_count) {
+                    if (looping) pos = 0 else break;
+                }
+                const sample_idx: usize = @as(usize, pos) * @as(usize, pcm.channels);
+                const left: f32 = @as(f32, @floatFromInt(pcm.samples[sample_idx])) / I16_TO_F32;
+                const right: f32 = if (pcm.channels >= 2)
+                    @as(f32, @floatFromInt(pcm.samples[sample_idx + 1])) / I16_TO_F32
+                else
+                    left; // mono -> duplicate to both channels
+
+                const out_idx: usize = @as(usize, frame) * 2;
+                const mixed_l = out[out_idx] + left * volume;
+                const mixed_r = out[out_idx + 1] + right * volume;
+                out[out_idx] = std.math.clamp(mixed_l, -1.0, 1.0);
+                out[out_idx + 1] = std.math.clamp(mixed_r, -1.0, 1.0);
+                pos += 1;
+            }
+            position.* = pos;
+        }
+
         // -- Test-only helpers ----------------------------------------
 
         /// Reset all slot state (for tests). NOT part of the public runtime
@@ -535,6 +653,7 @@ pub fn Mixer(comptime Sink: type) type {
 
 const testing = std.testing;
 const NullSink = device_sink.NullSink;
+const NullSinkF32 = device_sink.NullSinkF32;
 
 test "Mixer(NullSink): spinlock is exclusive and re-acquirable" {
     const M = Mixer(NullSink);
@@ -551,4 +670,20 @@ test "Mixer(NullSink): mix clears output when nothing plays" {
     var buf = [_]i16{ 123, 45, -67, 89 };
     M.mix(&buf, 2);
     for (buf) |s| try testing.expectEqual(@as(i16, 0), s);
+}
+
+test "Mixer(NullSink): resolves to the i16 output format" {
+    try testing.expectEqual(SampleFormat.i16, Mixer(NullSink).sample_format);
+}
+
+test "Mixer(NullSinkF32): resolves to the f32 output format" {
+    try testing.expectEqual(SampleFormat.f32, Mixer(NullSinkF32).sample_format);
+}
+
+test "Mixer(NullSinkF32): mixF32 clears output when nothing plays" {
+    const M = Mixer(NullSinkF32);
+    M.resetForTest();
+    var buf = [_]f32{ 0.5, -0.25, 0.75, -1.0 };
+    M.mixF32(&buf, 2);
+    for (buf) |s| try testing.expectEqual(@as(f32, 0.0), s);
 }

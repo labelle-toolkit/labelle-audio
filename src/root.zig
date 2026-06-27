@@ -22,10 +22,17 @@ pub const wav = @import("wav.zig");
 pub const device_sink = @import("device_sink.zig");
 pub const mixer = @import("mixer.zig");
 
-/// Pluggable audio device-sink contract + the `NullSink` reference impl.
+/// Pluggable audio device-sink contract + the `NullSink` reference impls.
+/// `NullSink` is the i16 reference sink; `NullSinkF32` the f32 one (sokol path).
 pub const DeviceSink = device_sink.DeviceSink;
 pub const NullSink = device_sink.NullSink;
+pub const NullSinkF32 = device_sink.NullSinkF32;
 pub const MixCallback = device_sink.MixCallback;
+
+/// f32 fill-callback variant + the output-format selector a sink declares via
+/// `pub const sample_format = .f32;`. The i16 `MixCallback` stays the default.
+pub const MixCallbackF32 = device_sink.MixCallbackF32;
+pub const SampleFormat = device_sink.SampleFormat;
 
 /// The shared PCM mixer, parameterized by a `DeviceSink`. Inject `NullSink`
 /// for headless / software-only backends; a real sink (miniaudio, AAudio) for
