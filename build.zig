@@ -41,6 +41,16 @@ pub fn build(b: *std.Build) void {
         // default but Linux CI needs it explicit, or the C TU fails to find the
         // headers. Propagates to any artifact that uses this module.
         .link_libc = true,
+        // decode.zig reaches `wav`/`DecodedAudio` through the BASE module BY NAME
+        // (not a path import of wav.zig). That's what lets a consumer import both
+        // `labelle-audio` and `labelle-audio-decode` in one Compile: every shared
+        // file (wav.zig, backend.zig) is rooted in exactly ONE module — the base —
+        // and decode references it by name. A path import re-roots those files
+        // into the decode module too → "file exists in two modules" (the sokol
+        // mixer+OGG case).
+        .imports = &.{
+            .{ .name = "labelle-audio", .module = audio_module },
+        },
     });
     decode_module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
     decode_module.addIncludePath(b.path("src"));
@@ -81,18 +91,38 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true, // stb_vorbis.c needs libc headers (Linux CI)
+            .imports = &.{
+                .{ .name = "labelle-audio", .module = audio_module },
+            },
         }),
     });
     decode_tests.root_module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
     decode_tests.root_module.addIncludePath(b.path("src"));
 
+    // Regression guard (#391): import BOTH the base mixer module AND the OGG
+    // decode module into ONE Compile — the sokol case that v0.4.0 couldn't build.
+    const both_modules_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/both_modules_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // decode module carries stb_vorbis (libc)
+            .imports = &.{
+                .{ .name = "labelle-audio", .module = audio_module },
+                .{ .name = "labelle-audio-decode", .module = decode_module },
+            },
+        }),
+    });
+
     const run_tests = b.addRunArtifact(tests);
     const run_root_tests = b.addRunArtifact(root_tests);
     const run_decode_tests = b.addRunArtifact(decode_tests);
+    const run_both_modules_test = b.addRunArtifact(both_modules_test);
     const test_step = b.step("test", "Run labelle-audio unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_root_tests.step);
     test_step.dependOn(&run_decode_tests.step);
+    test_step.dependOn(&run_both_modules_test.step);
 
     // -- `spec`: zspec behavioral specs --------------------------------
     const mixer_spec = b.addTest(.{

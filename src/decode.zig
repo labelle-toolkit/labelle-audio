@@ -42,12 +42,16 @@
 
 const std = @import("std");
 
-const wav = @import("wav.zig");
+// Reach `wav` (and `DecodedAudio`) through the BASE module BY NAME — NOT a path
+// import of wav.zig. A path import would re-root wav.zig (and its own import,
+// backend.zig) into this decode module, so a consumer that imports both
+// `labelle-audio` (mixer) and `labelle-audio-decode` (OGG) in one Compile — e.g.
+// sokol — would hit "file exists in modules 'labelle-audio' and
+// 'labelle-audio-decode'". By-name keeps every shared file rooted in the base.
+const wav = @import("labelle-audio").wav;
 
 /// The pure-Zig WAV decoder, re-exported so consumers of this module reach
-/// `wav.decode` / `wav.buildWav` without a second import of the base
-/// `labelle-audio` module (which would make `wav.zig` belong to two module
-/// roots — Zig forbids that).
+/// `wav.decode` / `wav.buildWav` without a second import of the base module.
 pub const wav_mod = wav;
 
 /// CPU-decoded interleaved-PCM audio, allocator-owned. Re-exported from the
