@@ -54,6 +54,14 @@ pub fn build(b: *std.Build) void {
     });
     decode_module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
     decode_module.addIncludePath(b.path("src"));
+    // For wasm32-emscripten, libc headers (<stdio.h>/<stdlib.h>/<math.h>) live
+    // in the emscripten SDK sysroot, NOT on any default system path — so
+    // `link_libc` alone (which only resolves libc at LINK time) leaves the
+    // stb_vorbis.c COMPILE unable to find <stdio.h>. Add the emsdk sysroot
+    // include path, gated to emscripten. The emsdk package is the same one
+    // raylib/sokol already pull (matching hash → fetched once), and lazy so
+    // native builds never fetch it.
+    addEmscriptenSysroot(b, decode_module, target);
 
     // -- `test`: built-in unit tests -----------------------------------
     // src/root.zig refAllDecls pulls in every module's inline tests
@@ -98,6 +106,7 @@ pub fn build(b: *std.Build) void {
     });
     decode_tests.root_module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
     decode_tests.root_module.addIncludePath(b.path("src"));
+    addEmscriptenSysroot(b, decode_tests.root_module, target);
 
     // Regression guard (#391): import BOTH the base mixer module AND the OGG
     // decode module into ONE Compile — the sokol case that v0.4.0 couldn't build.
@@ -183,4 +192,17 @@ pub fn build(b: *std.Build) void {
     spec_step.dependOn(&run_mixer_spec.step);
     spec_step.dependOn(&run_mixer_f32_spec.step);
     spec_step.dependOn(&run_decode_spec.step);
+}
+
+/// When building for wasm32-emscripten, the C source (stb_vorbis.c) needs the
+/// emscripten libc headers on its include path — they live in the emsdk
+/// sysroot, not on any default path, and `link_libc` only covers the link
+/// step. Add the sysroot include, gated to emscripten so native/other targets
+/// are untouched and never fetch the emsdk package. `lazyDependency` only
+/// fetches when this code path is actually reached (emscripten builds).
+fn addEmscriptenSysroot(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .emscripten) return;
+    if (b.lazyDependency("emsdk", .{})) |emsdk| {
+        module.addIncludePath(emsdk.path("upstream/emscripten/cache/sysroot/include"));
+    }
 }
