@@ -128,6 +128,28 @@ pub fn build(b: *std.Build) void {
     const run_decode_tests = b.addRunArtifact(decode_tests);
     const run_both_modules_test = b.addRunArtifact(both_modules_test);
     const test_step = b.step("test", "Run labelle-audio unit tests");
+    const threaded_wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }),
+    });
+    const threaded_audio = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = threaded_wasm_target,
+        .optimize = .ReleaseSafe,
+        .single_threaded = false,
+    });
+    const threaded_wasm = b.addObject(.{
+        .name = "threaded-wasm-audio",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/threaded_wasm.zig"),
+            .target = threaded_wasm_target,
+            .optimize = .ReleaseSafe,
+            .single_threaded = false,
+            .imports = &.{.{ .name = "labelle-audio", .module = threaded_audio }},
+        }),
+    });
+    test_step.dependOn(&threaded_wasm.step);
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_root_tests.step);
     test_step.dependOn(&run_decode_tests.step);

@@ -111,9 +111,17 @@ pub fn Mixer(comptime Sink: type) type {
         var master_volume: f32 = 1.0;
 
         // Allocator the mixer owns PCM with. Set by `init`; defaults to
-        // page_allocator (bgfx's choice) so `ensureInit`-only call paths
+        // page_allocator on supported targets so `ensureInit`-only call paths
         // still work if a host forgets to call `init`.
-        var allocator: std.mem.Allocator = std.heap.page_allocator;
+        var allocator: ?std.mem.Allocator = null;
+
+        fn pcmAllocator() std.mem.Allocator {
+            if (allocator) |value| return value;
+            const builtin = @import("builtin");
+            if (comptime builtin.cpu.arch.isWasm() and !builtin.single_threaded)
+                @panic("Threaded WebAssembly audio requires Mixer.init(allocator)");
+            return std.heap.page_allocator;
+        }
 
         // -- Slot spinlock (#298) -------------------------------------
         //
@@ -138,8 +146,9 @@ pub fn Mixer(comptime Sink: type) type {
 
         /// Set the allocator the mixer owns PCM with. Optional — defaults to
         /// `std.heap.page_allocator` (bgfx's behaviour). Call once before the
-        /// first load if you need a custom/tracking allocator (tests pass
-        /// `std.testing.allocator` to catch leaks). Does NOT start the device.
+        /// first load. Threaded WebAssembly requires an explicit allocator; its
+        /// standard page allocator is not implemented. Tests pass
+        /// `std.testing.allocator` to catch leaks. Does NOT start the device.
         pub fn init(alloc: std.mem.Allocator) void {
             allocator = alloc;
         }
@@ -183,7 +192,7 @@ pub fn Mixer(comptime Sink: type) type {
         }
 
         fn freePcm(pcm: PcmData) void {
-            if (pcm.raw_alloc.len > 0) allocator.free(pcm.raw_alloc);
+            if (pcm.raw_alloc.len > 0) pcmAllocator().free(pcm.raw_alloc);
         }
 
         // -- Decode helpers -------------------------------------------
@@ -192,7 +201,7 @@ pub fn Mixer(comptime Sink: type) type {
         /// + allocation must not block the mixer. Returns null on any decode
         /// error (the public API maps that to id 0).
         fn decodeOwned(data: []const u8) ?PcmData {
-            const dec = wav.decode(allocator, data) catch return null;
+            const dec = wav.decode(pcmAllocator(), data) catch return null;
             // `dec.samples` is allocator-owned; the mixer adopts it as
             // `raw_alloc`. `frame_count` is guaranteed > 0 (wav.decode rejects
             // EmptyPcm), so the mixer's wrap math can't divide by zero.
@@ -213,7 +222,7 @@ pub fn Mixer(comptime Sink: type) type {
             // and copies stereo); reject >2 channels rather than silently drop
             // the extra ones, matching the WAV decoder's strict validation.
             if (src.len == 0 or channels == 0 or channels > 2 or src.len % channels != 0) return null;
-            const owned = allocator.alloc(i16, src.len) catch return null;
+            const owned = pcmAllocator().alloc(i16, src.len) catch return null;
             @memcpy(owned, src);
             return PcmData{
                 .samples = owned,
