@@ -12,3 +12,12 @@ part of this library. Tracking issue:
 [labelle-engine#530](https://github.com/labelle-toolkit/labelle-engine/issues/530).
 
 [gfx258]: https://github.com/labelle-toolkit/labelle-gfx/pull/258
+
+## Music playback
+
+`Mixer(Sink).setMusicLooping(id, false)` opts a loaded music stream out of
+looping. The default is still looping. When a non-looping stream reaches EOF,
+`isMusicPlaying(id)` becomes false. It is also false while paused, so playlist
+callers must track whether they paused or stopped a stream themselves.
+Changing the flag does not seek, restart, or resume playback. Invalid/unloaded
+IDs are ignored. Supported by both i16 and f32 mixer output paths.
