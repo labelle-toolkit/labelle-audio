@@ -421,6 +421,17 @@ pub fn Mixer(comptime Sink: type) type {
             return music_slots[id].playing and !music_slots[id].paused;
         }
 
+        /// Music loops by default. Disable looping to stop at end-of-stream;
+        /// isMusicPlaying then becomes false (also false while paused).
+        /// Changing this flag preserves the current position and pause state.
+        pub fn setMusicLooping(id: u32, looping: bool) void {
+            if (id == 0 or id >= MAX_MUSIC) return;
+            lockSlots();
+            defer unlockSlots();
+            if (music_slots[id].pcm == null) return;
+            music_slots[id].looping = looping;
+        }
+
         pub fn setMusicVolume(id: u32, volume: f32) void {
             if (id == 0 or id >= MAX_MUSIC) return;
             lockSlots();
@@ -702,4 +713,46 @@ test "Mixer(NullSinkF32): mixF32 clears output when nothing plays" {
     var buf = [_]f32{ 0.5, -0.25, 0.75, -1.0 };
     M.mixF32(&buf, 2);
     for (buf) |s| try testing.expectEqual(@as(f32, 0.0), s);
+}
+
+// Exercise both sinks: Android/desktop use i16, other consumers may use f32.
+test "music loop control preserves pause and stops at EOF on both render paths" {
+    inline for (.{ NullSink, NullSinkF32 }) |Sink| {
+        const M = Mixer(Sink);
+        M.resetForTest();
+        M.init(testing.allocator);
+        defer M.deinit();
+        const id = M.loadMusicFromPcm(&.{ 1000, 1000, 2000, 2000 }, 2, 48000);
+        try testing.expect(id != 0);
+        M.playMusic(id);
+        const Sample = if (M.sample_format == .f32) f32 else i16;
+        var out: [6]Sample = undefined;
+        if (Sample == f32) M.mixF32(&out, 2) else M.mix(&out, 2);
+        // Default looping remains compatible: three frames from a two-frame track.
+        try testing.expect(M.isMusicPlaying(id));
+        try testing.expect(out[4] != 0);
+        const position = M.musicPositionSeconds(id);
+        M.pauseMusic(id);
+        M.setMusicLooping(id, false);
+        if (Sample == f32) M.mixF32(&out, 2) else M.mix(&out, 2);
+        try testing.expectEqual(position, M.musicPositionSeconds(id));
+        for (out) |sample| try testing.expectEqual(@as(Sample, 0), sample);
+        M.resumeMusic(id);
+        if (Sample == f32) M.mixF32(&out, 2) else M.mix(&out, 2);
+        try testing.expect(!M.isMusicPlaying(id));
+        try testing.expect(out[0] != 0);
+        try testing.expectEqual(@as(Sample, 0), out[2]);
+        // Replay retains non-looping mode; EOF exactly on a buffer edge stops too.
+        M.playMusic(id);
+        if (Sample == f32) M.mixF32(out[0..4], 2) else M.mix(out[0..4], 2);
+        try testing.expect(!M.isMusicPlaying(id));
+        M.setMusicLooping(id, true);
+        M.playMusic(id);
+        if (Sample == f32) M.mixF32(&out, 2) else M.mix(&out, 2);
+        try testing.expect(M.isMusicPlaying(id));
+        M.setMusicLooping(0, false);
+        M.setMusicLooping(std.math.maxInt(u32), false);
+        M.unloadMusic(id);
+        M.setMusicLooping(id, false);
+    }
 }
