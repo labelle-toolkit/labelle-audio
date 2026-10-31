@@ -1,4 +1,5 @@
 const std = @import("std");
+const emsdk_source = @import("emsdk_source.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -58,9 +59,10 @@ pub fn build(b: *std.Build) void {
     // in the emscripten SDK sysroot, NOT on any default system path — so
     // `link_libc` alone (which only resolves libc at LINK time) leaves the
     // stb_vorbis.c COMPILE unable to find <stdio.h>. Add the emsdk sysroot
-    // include path, gated to emscripten. The emsdk package is the same one
-    // raylib/sokol already pull (matching hash → fetched once), and lazy so
-    // native builds never fetch it.
+    // include path, gated to emscripten: from a valid `EMSDK` when one is set
+    // (labelle-assembler#823, same rule as labelle-bgfx), else from the emsdk
+    // package, which is the same one the backends pull (matching hash →
+    // fetched once) and lazy so native builds never fetch it.
     addEmscriptenSysroot(b, decode_module, target);
 
     // -- `test`: built-in unit tests -----------------------------------
@@ -155,6 +157,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_decode_tests.step);
     test_step.dependOn(&run_both_modules_test.step);
 
+    // The wasm emsdk-source decision (assembler#823): external EMSDK vs the
+    // package. Host-only, pure.
+    const emsdk_source_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("emsdk_source.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(emsdk_source_tests).step);
+
     // -- `spec`: zspec behavioral specs --------------------------------
     const mixer_spec = b.addTest(.{
         .root_module = b.createModule(.{
@@ -220,11 +233,40 @@ pub fn build(b: *std.Build) void {
 /// emscripten libc headers on its include path — they live in the emsdk
 /// sysroot, not on any default path, and `link_libc` only covers the link
 /// step. Add the sysroot include, gated to emscripten so native/other targets
-/// are untouched and never fetch the emsdk package. `lazyDependency` only
-/// fetches when this code path is actually reached (emscripten builds).
+/// are untouched and never fetch the emsdk package.
+///
+/// Source (emsdk_source.zig, the rule labelle-bgfx and labelle-imgui use): a
+/// valid `EMSDK` (`upstream/emscripten/emcc` + `.emscripten`, as labelle-web's
+/// provider exports it) supplies the sysroot, under `EM_CACHE` when set, filled
+/// at configure time when cold; the emsdk package is then not fetched at all
+/// (labelle-assembler#823). Otherwise `lazyDependency` fetches the package on
+/// first use, as before; its sysroot is populated by the backend's emsdk
+/// install (the same package, deduplicated by hash).
 fn addEmscriptenSysroot(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .emscripten) return;
-    if (b.lazyDependency("emsdk", .{})) |emsdk| {
-        module.addIncludePath(emsdk.path("upstream/emscripten/cache/sysroot/include"));
+    const BuildFs = struct {
+        b: *std.Build,
+        pub fn exists(self: @This(), path: []const u8) bool {
+            std.Io.Dir.cwd().access(self.b.graph.io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return false,
+                // Anything else (permissions, I/O) is not "missing": report it
+                // rather than silently falling back to the package.
+                else => std.debug.panic("emsdk: cannot check EMSDK path '{s}': {s}", .{ path, @errorName(err) }),
+            };
+            return true;
+        }
+    };
+    const source = emsdk_source.resolve(b.allocator, b.graph.environ_map.get("EMSDK"), .{
+        .emcc_name = emsdk_source.emccName(@import("builtin").os.tag),
+        .em_cache = b.graph.environ_map.get("EM_CACHE"),
+    }, BuildFs{ .b = b });
+    switch (source) {
+        .external => |ext| {
+            emsdk_source.ensureSysroot(b, ext);
+            module.addIncludePath(.{ .cwd_relative = ext.sysroot });
+        },
+        .package => if (b.lazyDependency("emsdk", .{})) |emsdk| {
+            module.addIncludePath(emsdk.path("upstream/emscripten/cache/sysroot/include"));
+        },
     }
 }
