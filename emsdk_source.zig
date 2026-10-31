@@ -22,9 +22,18 @@
 //! under `<EMSDK>/upstream/emscripten/cache`, so an `EM_CACHE` setup, or any
 //! cold cache, fell back to installing the package: the ~1.4 GB second emsdk
 //! of assembler#823. Now the sysroot is not part of the validity test:
-//! `resolve` reports where it is and whether it exists, and `ensureSysroot`
-//! fills a cold one at configure time with `embuilder build sysroot` (headers
-//! only, under a second), under the same emsdk's EM_CONFIG.
+//! `resolve` reports where it is and whether it is complete, and
+//! `ensureSysroot` fills an incomplete one at configure time with `embuilder
+//! build sysroot` (headers only, under a second), under the same emsdk's
+//! EM_CONFIG.
+//!
+//! "Complete" is Emscripten's own marker, `<cache>/sysroot_install.stamp`
+//! (`cache.get('sysroot_install.stamp', install_system_headers)`), never the
+//! `sysroot/include` directory: Emscripten creates that directory before it
+//! has finished copying the headers, so a configure racing a cold shared
+//! cache, or one after an interrupted header install, would otherwise skip
+//! embuilder (and Emscripten's cache lock) and compile against incomplete
+//! headers. embuilder takes that lock and is a no-op once the stamp exists.
 //!
 //! This file is the ONE rule shared by every package that compiles C/C++ for
 //! wasm32-emscripten, as identical copies: labelle-bgfx `emsdk_source.zig`,
@@ -45,12 +54,17 @@ pub const External = struct {
     /// `<cache>/sysroot/include`, where `<cache>` is `EM_CACHE` when set, else
     /// `<root>/upstream/emscripten/cache` (allocated with `resolve`'s `gpa`).
     sysroot: []const u8,
-    /// Whether `sysroot` exists already. False on a cold cache: call
+    /// `<cache>/sysroot_install.stamp`, Emscripten's marker that the sysroot
+    /// headers are completely installed (allocated with `resolve`'s `gpa`).
+    stamp: []const u8,
+    /// Whether `stamp` exists, i.e. the headers are complete. False on a cold
+    /// or half-installed cache (even if `sysroot` already exists): call
     /// `ensureSysroot` before handing `sysroot` to a compile.
     sysroot_ready: bool,
 
     pub fn deinit(self: External, gpa: std.mem.Allocator) void {
         gpa.free(self.sysroot);
+        gpa.free(self.stamp);
     }
 };
 
@@ -92,7 +106,11 @@ pub fn resolve(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, opts: Options, fs
         if (!fs.exists(path)) return .package;
     }
     const sysroot = sysrootInclude(gpa, root, opts.em_cache) catch return .package;
-    return .{ .external = .{ .root = root, .sysroot = sysroot, .sysroot_ready = fs.exists(sysroot) } };
+    const stamp = sysrootStamp(gpa, root, opts.em_cache) catch {
+        gpa.free(sysroot);
+        return .package;
+    };
+    return .{ .external = .{ .root = root, .sysroot = sysroot, .stamp = stamp, .sysroot_ready = fs.exists(stamp) } };
 }
 
 /// Null when `source` satisfies `expect` (or nothing is expected), else a
@@ -115,15 +133,25 @@ pub fn sysrootInclude(gpa: std.mem.Allocator, root: []const u8, em_cache: ?[]con
     return join(gpa, root, &sysroot_rel);
 }
 
+/// Emscripten's "sysroot headers installed" marker in the same cache:
+/// `<em_cache>/sysroot_install.stamp`, else
+/// `<root>/upstream/emscripten/cache/sysroot_install.stamp`.
+pub fn sysrootStamp(gpa: std.mem.Allocator, root: []const u8, em_cache: ?[]const u8) ![]u8 {
+    if (em_cache) |cache| if (cache.len != 0) return join(gpa, cache, &.{stamp_name});
+    return join(gpa, root, &.{ "upstream", "emscripten", "cache", stamp_name });
+}
+
 const sysroot_rel = [_][]const u8{ "upstream", "emscripten", "cache", "sysroot", "include" };
+const stamp_name = "sysroot_install.stamp";
 
 /// `<root>/upstream/emscripten/<tool>` (pass `emcc.bat` on Windows).
 pub fn toolPath(gpa: std.mem.Allocator, root: []const u8, tool: []const u8) ![]u8 {
     return join(gpa, root, &.{ "upstream", "emscripten", tool });
 }
 
-/// Make sure `ext.sysroot` exists before any C/C++ compile reads it: on a
-/// cold cache run `<root>/upstream/emscripten/embuilder build sysroot` now,
+/// Make sure `ext.sysroot` is complete before any C/C++ compile reads it:
+/// unless Emscripten's `sysroot_install.stamp` exists (`ext.sysroot_ready`),
+/// run `<root>/upstream/emscripten/embuilder build sysroot` now,
 /// at configure time, with EM_CONFIG pinned to `<root>/.emscripten` (the
 /// rest of the environment, `EM_CACHE` included, is inherited). Headers
 /// only, well under a second, and a no-op once the cache is warm.
@@ -149,10 +177,12 @@ pub fn ensureSysroot(b: *std.Build, ext: External) void {
         .exited => |code| if (code != 0) std.debug.panic("emsdk: '{s} build sysroot' exited with {d}", .{ embuilder, code }),
         else => std.debug.panic("emsdk: '{s} build sysroot' did not exit normally", .{embuilder}),
     }
-    std.Io.Dir.cwd().access(io, ext.sysroot, .{}) catch std.debug.panic(
-        "emsdk: '{s} build sysroot' succeeded but {s} is still missing (is EM_CACHE the cache this emsdk uses?)",
-        .{ embuilder, ext.sysroot },
-    );
+    for ([_][]const u8{ ext.stamp, ext.sysroot }) |path| {
+        std.Io.Dir.cwd().access(io, path, .{}) catch std.debug.panic(
+            "emsdk: '{s} build sysroot' succeeded but {s} is still missing (is EM_CACHE the cache this emsdk uses?)",
+            .{ embuilder, path },
+        );
+    }
 }
 
 fn join(gpa: std.mem.Allocator, root: []const u8, rel: []const []const u8) ![]u8 {
@@ -180,16 +210,18 @@ const FakeFs = struct {
 
 const unix_opts: Options = .{ .emcc_name = "emcc" };
 
-/// The paths of a complete layout: .emscripten, emcc, sysroot (default cache).
-fn validLayout(root: []const u8) ![3][]u8 {
+/// The paths of a complete layout: .emscripten, emcc, sysroot include and
+/// the sysroot_install.stamp (default cache).
+fn validLayout(root: []const u8) ![4][]u8 {
     return .{
         try std.fs.path.join(testing.allocator, &.{ root, ".emscripten" }),
         try std.fs.path.join(testing.allocator, &.{ root, "upstream", "emscripten", "emcc" }),
         try std.fs.path.join(testing.allocator, &.{ root, "upstream", "emscripten", "cache", "sysroot", "include" }),
+        try std.fs.path.join(testing.allocator, &.{ root, "upstream", "emscripten", "cache", "sysroot_install.stamp" }),
     };
 }
 
-fn freeLayout(layout: [3][]u8) void {
+fn freeLayout(layout: [4][]u8) void {
     for (layout) |p| testing.allocator.free(p);
 }
 
@@ -214,15 +246,16 @@ test "EMSDK empty: package (treated as unset)" {
     try testing.expectEqual(@as(usize, 0), probes);
 }
 
-test "EMSDK valid (.emscripten + emcc + sysroot): external, root passed through, sysroot ready" {
+test "EMSDK valid (.emscripten + emcc + installed sysroot): external, root passed through, sysroot ready" {
     const root = "/home/u/.cache/labelle-web/emsdk/v1/x86_64-linux/4.0.9-tag";
     const layout = try validLayout(root);
     defer freeLayout(layout);
     var probes: usize = 0;
-    const ext = try expectExternal(resolve(testing.allocator, root, unix_opts, FakeFs{ .present = &.{ layout[0], layout[1], layout[2] }, .probes = &probes }));
+    const ext = try expectExternal(resolve(testing.allocator, root, unix_opts, FakeFs{ .present = &.{ layout[0], layout[1], layout[2], layout[3] }, .probes = &probes }));
     defer ext.deinit(testing.allocator);
     try testing.expectEqualStrings(root, ext.root);
     try testing.expectEqualStrings(layout[2], ext.sysroot);
+    try testing.expectEqualStrings(layout[3], ext.stamp);
     try testing.expect(ext.sysroot_ready);
     // Every path was checked, not just one.
     try testing.expectEqual(@as(usize, 3), probes);
@@ -235,7 +268,7 @@ test "EMSDK missing .emscripten or emcc: package" {
     // Drop each required path in turn (not activated / not installed): each
     // alone must send the build to the package.
     for (0..2) |missing| {
-        var present: [2][]const u8 = undefined;
+        var present: [3][]const u8 = undefined;
         var n: usize = 0;
         for (layout, 0..) |p, i| if (i != missing) {
             present[n] = p;
@@ -271,20 +304,47 @@ test "#823: EM_CACHE set: the sysroot is looked up under EM_CACHE, not the emsdk
     const opts: Options = .{ .emcc_name = "emcc", .em_cache = cache };
     var probes: usize = 0;
     // A sysroot under the emsdk does not count when EM_CACHE points elsewhere...
-    const cold = try expectExternal(resolve(testing.allocator, root, opts, FakeFs{ .present = &.{ layout[0], layout[1], layout[2] }, .probes = &probes }));
+    const cold = try expectExternal(resolve(testing.allocator, root, opts, FakeFs{ .present = &.{ layout[0], layout[1], layout[2], layout[3] }, .probes = &probes }));
     defer cold.deinit(testing.allocator);
     try testing.expectEqualStrings(cache_sysroot, cold.sysroot);
     try testing.expect(!cold.sysroot_ready);
     // ...the one under EM_CACHE does.
-    const warm = try expectExternal(resolve(testing.allocator, root, opts, FakeFs{ .present = &.{ layout[0], layout[1], cache_sysroot }, .probes = &probes }));
+    const cache_stamp = try std.fs.path.join(testing.allocator, &.{ cache, "sysroot_install.stamp" });
+    defer testing.allocator.free(cache_stamp);
+    const warm = try expectExternal(resolve(testing.allocator, root, opts, FakeFs{ .present = &.{ layout[0], layout[1], cache_sysroot, cache_stamp }, .probes = &probes }));
     defer warm.deinit(testing.allocator);
     try testing.expect(warm.sysroot_ready);
     // An empty EM_CACHE is unset.
     const empty: Options = .{ .emcc_name = "emcc", .em_cache = "" };
-    const dflt = try expectExternal(resolve(testing.allocator, root, empty, FakeFs{ .present = &.{ layout[0], layout[1], layout[2] }, .probes = &probes }));
+    const dflt = try expectExternal(resolve(testing.allocator, root, empty, FakeFs{ .present = &.{ layout[0], layout[1], layout[2], layout[3] }, .probes = &probes }));
     defer dflt.deinit(testing.allocator);
     try testing.expectEqualStrings(layout[2], dflt.sysroot);
     try testing.expect(dflt.sysroot_ready);
+}
+
+test "sysroot include dir present but no sysroot_install.stamp: not ready (half-installed headers)" {
+    // Emscripten creates sysroot/include before it has copied every header;
+    // only the stamp says the install finished. A cache in that state (a
+    // concurrent cold install, or an interrupted one) must still run embuilder.
+    const root = "/opt/emsdk";
+    const cache = "/cache/emscripten";
+    const layout = try validLayout(root);
+    defer freeLayout(layout);
+    const cache_sysroot = try std.fs.path.join(testing.allocator, &.{ cache, "sysroot", "include" });
+    defer testing.allocator.free(cache_sysroot);
+    var probes: usize = 0;
+    // Default cache: include dir, no stamp.
+    const a = try expectExternal(resolve(testing.allocator, root, unix_opts, FakeFs{ .present = &.{ layout[0], layout[1], layout[2] }, .probes = &probes }));
+    defer a.deinit(testing.allocator);
+    try testing.expect(!a.sysroot_ready);
+    try testing.expectEqualStrings(layout[3], a.stamp);
+    // EM_CACHE: include dir, no stamp.
+    const opts: Options = .{ .emcc_name = "emcc", .em_cache = cache };
+    const b = try expectExternal(resolve(testing.allocator, root, opts, FakeFs{ .present = &.{ layout[0], layout[1], cache_sysroot }, .probes = &probes }));
+    defer b.deinit(testing.allocator);
+    try testing.expect(!b.sysroot_ready);
+    try testing.expect(std.mem.endsWith(u8, b.stamp, "sysroot_install.stamp"));
+    try testing.expect(std.mem.startsWith(u8, b.stamp, cache));
 }
 
 test "EMSDK with only upstream/emscripten (no emcc for this host): package" {
@@ -296,18 +356,31 @@ test "EMSDK with only upstream/emscripten (no emcc for this host): package" {
     var probes: usize = 0;
     const win: Options = .{ .emcc_name = "emcc.bat" };
     // A Linux/macOS layout (emcc, no emcc.bat) is not valid for a Windows host.
-    const src = resolve(testing.allocator, root, win, FakeFs{ .present = &.{ layout[0], layout[1], layout[2], bare }, .probes = &probes });
+    const src = resolve(testing.allocator, root, win, FakeFs{ .present = &.{ layout[0], layout[1], layout[2], layout[3], bare }, .probes = &probes });
     try testing.expect(src == .package);
 }
 
 test "mismatch: -Demsdk_expect gates the chosen source both ways" {
-    const ext: Source = .{ .external = .{ .root = "/e", .sysroot = "/e/s", .sysroot_ready = true } };
+    const ext: Source = .{ .external = .{ .root = "/e", .sysroot = "/e/s", .stamp = "/e/t", .sysroot_ready = true } };
     try testing.expect(mismatch(.package, null) == null);
     try testing.expect(mismatch(ext, null) == null);
     try testing.expect(mismatch(ext, .external) == null);
     try testing.expect(mismatch(.package, .package) == null);
     try testing.expect(mismatch(.package, .external) != null);
     try testing.expect(mismatch(ext, .package) != null);
+}
+
+test "sysrootStamp sits beside sysroot/ in the same cache" {
+    const s1 = try sysrootStamp(testing.allocator, "/e", null);
+    defer testing.allocator.free(s1);
+    const want1 = try std.fs.path.join(testing.allocator, &.{ "/e", "upstream", "emscripten", "cache", "sysroot_install.stamp" });
+    defer testing.allocator.free(want1);
+    try testing.expectEqualStrings(want1, s1);
+    const s2 = try sysrootStamp(testing.allocator, "/e", "/c");
+    defer testing.allocator.free(s2);
+    const want2 = try std.fs.path.join(testing.allocator, &.{ "/c", "sysroot_install.stamp" });
+    defer testing.allocator.free(want2);
+    try testing.expectEqualStrings(want2, s2);
 }
 
 test "sysrootInclude and toolPath sit under upstream/emscripten" {
