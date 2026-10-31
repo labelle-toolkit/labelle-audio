@@ -19,7 +19,8 @@
         },
         // emscripten SDK — only used to resolve the wasm32-emscripten libc
         // sysroot include path so stb_vorbis.c finds <stdio.h> when compiled
-        // for the web. `lazy` so native builds never fetch it. Same url+hash
+        // for the web. `lazy` so native builds never fetch it, and a wasm
+        // build with a valid `EMSDK` doesn't either (emsdk_source.zig). Same url+hash
         // raylib/sokol already pin, so the build graph dedupes it to one copy.
         .emsdk = .{
             .url = "git+https://github.com/emscripten-core/emsdk#4.0.9",
@@ -30,6 +31,8 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        // Imported by build.zig: which emsdk a wasm build uses (assembler#823).
+        "emsdk_source.zig",
         "src",
         "test",
         "README.md",
