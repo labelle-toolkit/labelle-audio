@@ -256,6 +256,10 @@ pub fn resample(
 }
 
 fn decodeMp3(data: []const u8, allocator: std.mem.Allocator) DecodeError!DecodedAudio {
+    // dr_mp3 takes a `size_t`, but its frame search narrows the length to a
+    // signed `int` and subtracts from it. Reject what doesn't fit `c_int`, as
+    // `decodeOgg` does, rather than let that wrap negative.
+    if (std.math.cast(c_int, data.len) == null) return DecodeError.AudioTooLarge;
     var config: drmp3.drmp3_config = .{ .channels = 0, .sampleRate = 0 };
     var frame_count: drmp3.drmp3_uint64 = 0;
     // Decodes the whole stream into a dr_mp3-owned (malloc) buffer. We copy
