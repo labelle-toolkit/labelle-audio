@@ -255,11 +255,16 @@ pub fn resample(
     return out;
 }
 
+/// Largest MP3 `decodeAudio` hands to dr_mp3; see `decodeMp3`.
+pub const max_mp3_bytes: usize = 512 * 1024 * 1024;
+
 fn decodeMp3(data: []const u8, allocator: std.mem.Allocator) DecodeError!DecodedAudio {
     // dr_mp3 takes a `size_t`, but its frame search narrows the length to a
-    // signed `int` and subtracts from it. Reject what doesn't fit `c_int`, as
-    // `decodeOgg` does, rather than let that wrap negative.
-    if (std.math.cast(c_int, data.len) == null) return DecodeError.AudioTooLarge;
+    // signed `int` and adds frame-sized lookahead to positions in it
+    // (`i + 2*k` in `drmp3d_find_frame`). Cap the input well below INT_MAX so
+    // that arithmetic can't overflow: 512 MiB is hours of MP3, far past any
+    // game track, and leaves ~1.5 GiB of headroom for the lookahead.
+    if (data.len > max_mp3_bytes) return DecodeError.AudioTooLarge;
     var config: drmp3.drmp3_config = .{ .channels = 0, .sampleRate = 0 };
     var frame_count: drmp3.drmp3_uint64 = 0;
     // Decodes the whole stream into a dr_mp3-owned (malloc) buffer. We copy
