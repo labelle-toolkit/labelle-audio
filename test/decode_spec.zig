@@ -109,12 +109,17 @@ test "decodeAudio rejects a malformed OGG gracefully (links stb_vorbis, no panic
 
 test "decodeAudio rejects unsupported file types" {
     try testing.expectError(DecodeError.AudioUnsupportedFormat, decodeAudio("flac", "xxxx", testing.allocator));
-    try testing.expectError(DecodeError.AudioUnsupportedFormat, decodeAudio("mp3", "xxxx", testing.allocator));
 }
 
-test "decodeAudio rejects empty input for both formats" {
+test "decodeAudio rejects a malformed MP3 gracefully (links dr_mp3, no panic)" {
+    var poison = PoisonAllocator{ .backing = testing.allocator };
+    try testing.expectError(DecodeError.AudioDecodeFailed, decodeAudio("mp3", "xxxx", poison.allocator()));
+}
+
+test "decodeAudio rejects empty input for every format" {
     try testing.expectError(DecodeError.AudioEmptyInput, decodeAudio("wav", "", testing.allocator));
     try testing.expectError(DecodeError.AudioEmptyInput, decodeAudio("ogg", "", testing.allocator));
+    try testing.expectError(DecodeError.AudioEmptyInput, decodeAudio("mp3", "", testing.allocator));
 }
 
 test "decodeAudio surfaces WAV parse errors without panicking (poison alloc)" {
