@@ -24,7 +24,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // The OPT-IN multi-format decoder module (issue #391). Carries the
-    // `stb_vorbis` C source so the shared `decodeAudio` can decode OGG; the
+    // `stb_vorbis` C source so the shared `decodeAudio` can decode OGG, and the
+    // vendored `dr_mp3` (labelle-bgfx#213) for MP3, plus a resampler; the
     // base `labelle-audio` module above stays C-free. Only backends that need
     // OGG (sokol, raylib) depend on this — bgfx / wgpu consume just the
     // pure-Zig mixer and never compile stb_vorbis.
@@ -53,8 +54,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "labelle-audio", .module = audio_module },
         },
     });
-    decode_module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
-    decode_module.addIncludePath(b.path("src"));
+    addDecoderCSources(b, decode_module);
     // For wasm32-emscripten, libc headers (<stdio.h>/<stdlib.h>/<math.h>) live
     // in the emscripten SDK sysroot, NOT on any default system path — so
     // `link_libc` alone (which only resolves libc at LINK time) leaves the
@@ -106,8 +106,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    decode_tests.root_module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
-    decode_tests.root_module.addIncludePath(b.path("src"));
+    addDecoderCSources(b, decode_tests.root_module);
     addEmscriptenSysroot(b, decode_tests.root_module, target);
 
     // Regression guard (#391): import BOTH the base mixer module AND the OGG
@@ -120,6 +119,20 @@ pub fn build(b: *std.Build) void {
             .link_libc = true, // decode module carries stb_vorbis (libc)
             .imports = &.{
                 .{ .name = "labelle-audio", .module = audio_module },
+                .{ .name = "labelle-audio-decode", .module = decode_module },
+            },
+        }),
+    });
+
+    // Fixture-driven MP3/OGG decode + resample-to-48k tests (labelle-bgfx#213).
+    // A module root inside test/ so it can @embedFile test/fixtures/*.
+    const decode_formats_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/decode_formats_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
                 .{ .name = "labelle-audio-decode", .module = decode_module },
             },
         }),
@@ -156,6 +169,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_root_tests.step);
     test_step.dependOn(&run_decode_tests.step);
     test_step.dependOn(&run_both_modules_test.step);
+    test_step.dependOn(&b.addRunArtifact(decode_formats_test).step);
 
     // The wasm emsdk-source decision (assembler#823): external EMSDK vs the
     // package. Host-only, pure.
@@ -227,6 +241,16 @@ pub fn build(b: *std.Build) void {
     spec_step.dependOn(&run_mixer_spec.step);
     spec_step.dependOn(&run_mixer_f32_spec.step);
     spec_step.dependOn(&run_decode_spec.step);
+}
+
+/// The decoder module's C side: the stb_vorbis TU (OGG) and the dr_mp3
+/// implementation TU (MP3, `src/dr_mp3.c` includes the vendored
+/// `src/dr_mp3.h` with `DR_MP3_IMPLEMENTATION`), plus `src/` on the include
+/// path so `decode.zig`'s cImports find `stb_vorbis_decl.h` and `dr_mp3.h`.
+fn addDecoderCSources(b: *std.Build, module: *std.Build.Module) void {
+    module.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
+    module.addCSourceFile(.{ .file = b.path("src/dr_mp3.c"), .flags = &.{} });
+    module.addIncludePath(b.path("src"));
 }
 
 /// When building for wasm32-emscripten, the C source (stb_vorbis.c) needs the
